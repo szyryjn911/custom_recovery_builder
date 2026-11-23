@@ -106,24 +106,25 @@ jobs:
             ""
             
     - name: Set-up Manifest
+      id: sync
+      shell: bash
       if: github.event.inputs.MANIFEST_BRANCH == '11.0' || github.event.inputs.MANIFEST_BRANCH == '12.1' || github.event.inputs.MANIFEST_BRANCH == '14.1' || github.event.inputs.MANIFEST_BRANCH == '16.0'
       run: |
         mkdir -p ${GITHUB_WORKSPACE}/OrangeFox
         cd ${GITHUB_WORKSPACE}/OrangeFox
-        git config --global user.name "naden01"
-        git config --global user.email "naden.irsyad01@gmail.com"
+        git config --global user.name "github-actions[bot]"
+        git config --global user.email "github-actions[bot]@users.noreply.github.com"
         git clone https://gitlab.com/OrangeFox/sync.git
         cd sync
-        ./orangefox_sync.sh --branch ${{ github.event.inputs.MANIFEST_BRANCH }} --path ${GITHUB_WORKSPACE}/OrangeFox/fox_${{ github.event.inputs.MANIFEST_BRANCH }}
-      continue-on-error: true
+        ./orangefox_sync.sh --branch ${{ github.event.inputs.MANIFEST_BRANCH }} --path ${GITHUB_WORKSPACE}/OrangeFox/fox_${{ github.event.inputs.MANIFEST_BRANCH }} 2>&1 | tee "$GITHUB_WORKSPACE/sync.log"
        
     - name: Clone Device Tree
+      id: clone
       run: |
         cd ${GITHUB_WORKSPACE}/OrangeFox/fox_${{ github.event.inputs.MANIFEST_BRANCH }}
         git clone ${{ github.event.inputs.DEVICE_TREE }} -b ${{ github.event.inputs.DEVICE_TREE_BRANCH }} ./${{ github.event.inputs.DEVICE_PATH }}
         cd ${{ github.event.inputs.DEVICE_PATH }}
         echo "COMMIT_ID=$(git rev-parse HEAD)" >> $GITHUB_ENV
-      continue-on-error: true
         
     - name: Check Manifest Branch
       run: |
@@ -134,7 +135,6 @@ jobs:
         else
             echo "LUNCH_CMD=lunch omni_${{ github.event.inputs.DEVICE_NAME }}-eng && mka ${{ github.event.inputs.BUILD_TARGET }}image" >> $GITHUB_ENV
         fi
-      continue-on-error: true
     - name: Restore ccache
       uses: actions/cache/restore@v4
       with:
@@ -144,6 +144,8 @@ jobs:
           ccache-${{ github.event.inputs.MANIFEST_BRANCH }}-
       continue-on-error: true
     - name: Building OrangeFox
+      id: build
+      shell: bash
       env:
         USE_CCACHE: "1"
         CCACHE_EXEC: /usr/bin/ccache
@@ -157,8 +159,7 @@ jobs:
         source build/envsetup.sh
         export ALLOW_MISSING_DEPENDENCIES=true
         set -e
-        eval "${LUNCH_CMD}"
-      continue-on-error: true
+        { eval "${LUNCH_CMD}"; } 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
       
     - name: Save ccache
       if: always()
@@ -172,25 +173,29 @@ jobs:
       run: |
         echo "BUILD_DATE=$(TZ=Asia/Manila date +%Y%m%d)" >> $GITHUB_ENV
 
-    - name: Check if Recovery Exist
+    - name: Verify Image Built
+      id: verify
       run: |
-        cd ${GITHUB_WORKSPACE}/OrangeFox/fox_${{ github.event.inputs.MANIFEST_BRANCH }}
-        if [ -f out/target/product/${{ github.event.inputs.DEVICE_NAME }}/OrangeFox*.img ]; then
-            echo "CHECK_IMG_IS_OK=true" >> $GITHUB_ENV
-            echo "MD5_IMG=$(md5sum out/target/product/${{ github.event.inputs.DEVICE_NAME }}/OrangeFox*.img | cut -d ' ' -f 1)" >> $GITHUB_ENV
-        else
-            echo "Recovery out directory is empty."
+        cd ${GITHUB_WORKSPACE}/OrangeFox/fox_${{ github.event.inputs.MANIFEST_BRANCH }}/out/target/product/${{ github.event.inputs.DEVICE_NAME }}
+        if ! compgen -G "OrangeFox*.img" > /dev/null; then
+          echo "::error::No OrangeFox*.img found in out directory"
+          ls -la || true
+          exit 1
         fi
-        if [ -f out/target/product/${{ github.event.inputs.DEVICE_NAME }}/OrangeFox*.zip ]; then
-            echo "CHECK_ZIP_IS_OK=true" >> $GITHUB_ENV
-            echo "MD5_ZIP=$(md5sum out/target/product/${{ github.event.inputs.DEVICE_NAME }}/OrangeFox*.zip | cut -d ' ' -f 1)" >> $GITHUB_ENV
+        IMG=$(ls OrangeFox*.img | head -n1)
+        echo "CHECK_IMG_IS_OK=true" >> $GITHUB_ENV
+        echo "MD5_IMG=$(md5sum "$IMG" | cut -d ' ' -f 1)" >> $GITHUB_ENV
+        ls -lh "$IMG"
+        if compgen -G "OrangeFox*.zip" > /dev/null; then
+          ZIP=$(ls OrangeFox*.zip | head -n1)
+          echo "CHECK_ZIP_IS_OK=true" >> $GITHUB_ENV
+          echo "MD5_ZIP=$(md5sum "$ZIP" | cut -d ' ' -f 1)" >> $GITHUB_ENV
         else
-            echo "Recovery out directory is empty."
+          echo "::warning::No OrangeFox*.zip found (only img will be released)"
         fi
-      continue-on-error: true
-      
+
     - name: Upload to Release
-      if: env.CHECK_IMG_IS_OK == 'true' && env.CHECK_ZIP_IS_OK == 'true'
+      if: env.CHECK_IMG_IS_OK == 'true'
       uses: softprops/action-gh-release@v1
       with:
         files: |
@@ -204,7 +209,6 @@ jobs:
           Commit: Most recent [commit](${{ env.CLEAN_DEVICE_TREE }}/commit/${{ env.COMMIT_ID }}) during building.
           MD5 (img): ${{ env.MD5_IMG }}
           MD5 (zip): ${{ env.MD5_ZIP }}
-      continue-on-error: true
         
     - name: Run LDCheck
       if: github.event.inputs.LDCHECK == 'true'
@@ -235,3 +239,60 @@ jobs:
           "${{ secrets.GITHUB_TOKEN }}" \
           "${{ github.repository }}" \
           "${{ github.run_id }}"
+
+    - name: Notify Telegram — Build Failed
+      if: failure()
+      env:
+        TG_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+        TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        DEVICE: ${{ github.event.inputs.DEVICE_NAME }}
+        MANIFEST: ${{ github.event.inputs.MANIFEST_BRANCH }}
+        TREE: ${{ github.event.inputs.DEVICE_TREE }}
+        TREE_BRANCH: ${{ github.event.inputs.DEVICE_TREE_BRANCH }}
+        SYNC_OUTCOME: ${{ steps.sync.outcome }}
+        CLONE_OUTCOME: ${{ steps.clone.outcome }}
+        BUILD_OUTCOME: ${{ steps.build.outcome }}
+        VERIFY_OUTCOME: ${{ steps.verify.outcome }}
+      run: |
+        [ -z "$TG_TOKEN" ] || [ -z "$TG_CHAT" ] && { echo "Telegram secrets missing"; exit 0; }
+
+        if [ "$SYNC_OUTCOME" = "failure" ]; then STAGE="Syncing OrangeFox manifest"; LOG="$GITHUB_WORKSPACE/sync.log"
+        elif [ "$CLONE_OUTCOME" = "failure" ]; then STAGE="Cloning device tree (check tree URL/branch)"; LOG=""
+        elif [ "$BUILD_OUTCOME" = "failure" ]; then STAGE="Building OrangeFox"; LOG="$GITHUB_WORKSPACE/build.log"
+        elif [ "$VERIFY_OUTCOME" = "failure" ]; then STAGE="Image was not produced"; LOG="$GITHUB_WORKSPACE/build.log"
+        else STAGE="Other step (check run log)"; LOG="$GITHUB_WORKSPACE/build.log"; fi
+
+        ERR=""
+        if [ -n "$LOG" ] && [ -f "$LOG" ]; then
+          sed -i 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$LOG"
+          N=$(grep -n -m1 'FAILED:' "$LOG" | cut -d: -f1)
+          if [ -n "$N" ]; then ERR=$(sed -n "${N},$((N+12))p" "$LOG" | cut -c1-300)
+          else ERR=$(tail -n 20 "$LOG" | cut -c1-300); fi
+        fi
+
+        {
+          echo "❌ Build FAILED"
+          echo "Workflow: ${{ github.workflow }}"
+          echo "Device: $DEVICE"
+          echo "Manifest: $MANIFEST"
+          echo "Tree: $TREE ($TREE_BRANCH)"
+          echo "Failed at: $STAGE"
+          echo "Run: $RUN_URL"
+          if [ -n "$ERR" ]; then echo; echo "Error:"; echo "$ERR"; fi
+        } | head -c 3800 > /tmp/msg.txt
+
+        curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+          -d chat_id="$TG_CHAT" --data-urlencode text@/tmp/msg.txt || true
+
+        if [ -n "$LOG" ] && [ -f "$LOG" ]; then
+          SEND="$LOG"
+          if [ "$(stat -c%s "$LOG")" -gt 45000000 ]; then
+            tail -n 20000 "$LOG" > /tmp/tail.log; SEND=/tmp/tail.log
+          fi
+          cp "$SEND" "/tmp/ofox_${DEVICE}_failed.log"
+          curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendDocument" \
+            -F chat_id="$TG_CHAT" -F document=@"/tmp/ofox_${DEVICE}_failed.log" \
+            -F caption="🪵 Log ($DEVICE) - failed at: $STAGE" || true
+        fi
+        
