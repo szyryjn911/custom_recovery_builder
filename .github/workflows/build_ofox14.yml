@@ -126,6 +126,16 @@ jobs:
         cd ${{ github.event.inputs.DEVICE_PATH }}
         echo "COMMIT_ID=$(git rev-parse HEAD)" >> $GITHUB_ENV
         
+    - name: Apply Maintainer Avatar
+      run: |
+        cd ${GITHUB_WORKSPACE}/OrangeFox/fox_${{ github.event.inputs.MANIFEST_BRANCH }}
+        AV="${{ github.event.inputs.DEVICE_PATH }}/maintainer.png"
+        if [ -f "$AV" ]; then
+          find bootable/recovery/gui/theme -path "*/Default/About/maintainer.png" | while read f; do cp -v "$AV" "$f"; done
+        else
+          echo "No maintainer.png in device tree, skipping"
+        fi
+
     - name: Check Manifest Branch
       run: |
         if [ "${{ github.event.inputs.MANIFEST_BRANCH }}" == "16.0" ]; then
